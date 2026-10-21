@@ -187,7 +187,7 @@ BOOL WINAPI hkAdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD
 typedef long (__thiscall *SetViewport_t)(void* pThis, DWORD x, DWORD y, DWORD w, DWORD h);
 static SetViewport_t oSetViewport = nullptr;
 
-long __thiscall hkSetViewport(void* pThis, DWORD x, DWORD y, DWORD w, DWORD h)
+long __fastcall hkSetViewport(void* pThis, void* /*unused*/, DWORD x, DWORD y, DWORD w, DWORD h)
 {
     if (g_forceViewport)
     {
@@ -209,7 +209,7 @@ long __thiscall hkSetViewport(void* pThis, DWORD x, DWORD y, DWORD w, DWORD h)
 typedef long (__thiscall *SetDisplayMode_t)(void* pThis, DWORD width, DWORD height, BYTE bpp, BYTE flag);
 static SetDisplayMode_t oSetDisplayMode = nullptr;
 
-long __thiscall hkSetDisplayMode(void* pThis, DWORD width, DWORD height, BYTE bpp, BYTE flag)
+long __fastcall hkSetDisplayMode(void* pThis, void* /*unused*/, DWORD width, DWORD height, BYTE bpp, BYTE flag)
 {
     Log("[SetDisplayMode] width=%u height=%u bpp=%u flag=%u\n", width, height, bpp, flag);
 
@@ -246,7 +246,7 @@ static CreateImage_t oCreateImage = nullptr;
 typedef long (WINAPI *AGLGetLastError_t)();
 static AGLGetLastError_t oAGLGetLastError = nullptr;
 
-void* __thiscall hkCreateImage(void* pThis, DWORD w, DWORD h, BYTE type, WORD flags)
+void* __fastcall hkCreateImage(void* pThis, void* /*unused*/, DWORD w, DWORD h, BYTE type, WORD flags)
 {
     void* result = oCreateImage(pThis, w, h, type, flags);
     if (g_logResources)
