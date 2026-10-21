@@ -1,0 +1,34 @@
+name: Build PPWidescreenFix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone MinHook source
+        run: git clone --depth 1 https://github.com/TsudaKageyu/minhook.git minhook
+
+      - name: Setup MSVC build environment (x86 / 32-bit)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile PPWidescreenFix.cpp + MinHook into dinput8.dll
+        shell: cmd
+        run: |
+          cl.exe /LD /EHsc /O2 /DWIN32 /D_WINDOWS ^
+            /I minhook\include /I minhook\src /I minhook\src\hde ^
+            PPWidescreenFix.cpp ^
+            minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde32.c ^
+            /Fe:dinput8.dll
+
+      - name: Upload built DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: dinput8-dll
+          path: dinput8.dll
