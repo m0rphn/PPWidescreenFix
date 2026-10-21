@@ -25,7 +25,8 @@ jobs:
             /I minhook\include /I minhook\src /I minhook\src\hde ^
             PPWidescreenFix.cpp ^
             minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde32.c ^
-            /Fe:dinput8.dll
+            /Fe:dinput8.dll ^
+            /link /DEF:dinput8.def
 
       - name: Upload built DLL
         uses: actions/upload-artifact@v4
