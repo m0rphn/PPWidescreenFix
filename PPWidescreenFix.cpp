@@ -1,5 +1,5 @@
 // ============================================================================
-// PPWidescreenFix v1.2 (RECON build) - Native resolution plugin for
+// PPWidescreenFix v1.3 (virtual canvas) - Native resolution plugin for
 //   Pink Panther: Pinkadelic Pursuit (2002)
 //   v1.0 ENGLISH No-CD/Fixed EXE
 //
@@ -86,6 +86,22 @@ static bool g_logResources  = false;
 static bool g_logToFile     = true;
 static bool g_recon         = true;   // log what the game sends to Direct3D (no behaviour change)
 
+// --- v1.3 "virtual canvas" ---------------------------------------------------
+// The exe lays EVERYTHING out (HUD, menus, full-screen quads, 3D projection) from
+// two ints it stores right after SetDisplayMode (struct at exe VA 0x443d44,
+// +8 = width, +0xC = height). We overwrite those with a VIRTUAL size and then,
+// in the DrawPrimitive hook, scale every pre-transformed vertex up to the real
+// surface. Everything stays internally consistent.
+//   Mode 0 = off (v1.2 behaviour)
+//   Mode 1 = virtual canvas with the screen's aspect ratio, e.g. 853x480 (TRUE WIDESCREEN)
+//   Mode 2 = virtual 640x480 canvas, centered with bars (PILLARBOX, the original layout)
+static int   g_mode      = 2;
+static bool  g_keep43    = true;     // mode 1: full-screen textured images (menus/loading) stay 4:3
+static int   g_virtW     = 640, g_virtH = 480;
+static float g_scale     = 1.0f, g_offX = 0.0f, g_offY = 0.0f;
+static float g_off43     = 0.0f, g_offY43 = 0.0f, g_scale43x = 1.0f, g_scale43y = 1.0f;
+static bool  g_clearBars = false;
+
 static const int ORIG_CLIENT_WIDTH  = 640;
 static const int ORIG_CLIENT_HEIGHT = 480;
 
@@ -93,6 +109,8 @@ static FILE* g_log = nullptr;
 
 // defined in the RECON section below; the AGLSCREEN hooks call it
 static void TryHookDevice(void* screen);
+static void ApplyVirtualScreen();
+static void ClearBackBuffer(void* screen);
 
 static void LogInit()
 {
@@ -110,6 +128,35 @@ static void Log(const char* fmt, ...)
     fflush(g_log);
 }
 
+static void ComputeVirtualCanvas()
+{
+    float W = (float)g_targetWidth, H = (float)g_targetHeight;
+    g_virtH = 480;
+    if (g_mode == 1)
+    {
+        g_scale = H / 480.0f;
+        g_virtW = (int)(480.0 * g_targetWidth / g_targetHeight + 0.5);
+        if (g_virtW < 640) g_virtW = 640;
+        g_offX = (W - g_virtW * g_scale) * 0.5f;
+        g_offY = 0.0f;
+    }
+    else
+    {
+        g_virtW = 640;
+        float sx = W / 640.0f, sy = H / 480.0f;
+        g_scale = (sx < sy) ? sx : sy;
+        g_offX = (W - 640.0f * g_scale) * 0.5f;
+        g_offY = (H - 480.0f * g_scale) * 0.5f;
+    }
+    // where a 4:3 image goes when it must keep its shape (mode 1 menus / loading screens)
+    float s43 = (W / 640.0f < H / 480.0f) ? (W / 640.0f) : (H / 480.0f);
+    g_off43    = (W - 640.0f * s43) * 0.5f;
+    g_offY43   = (H - 480.0f * s43) * 0.5f;
+    g_scale43x = (640.0f * s43) / (float)g_virtW;
+    g_scale43y = s43;
+    g_clearBars = (g_mode == 2) || (g_mode == 1 && g_keep43);
+}
+
 static void LoadConfig()
 {
     char iniPath[MAX_PATH];
@@ -124,6 +171,10 @@ static void LoadConfig()
     g_forceViewport = GetPrivateProfileIntA("Settings", "ForceFullViewport", 0, INI_NAME) != 0;
     g_logResources  = GetPrivateProfileIntA("Settings", "LogResourceCalls", 0, INI_NAME) != 0;
     g_recon         = GetPrivateProfileIntA("Settings", "Recon", 1, INI_NAME) != 0;
+    g_mode          = GetPrivateProfileIntA("Settings", "Mode", 2, INI_NAME);
+    g_keep43        = GetPrivateProfileIntA("Settings", "Keep43Backdrops", 1, INI_NAME) != 0;
+    if (g_mode < 0 || g_mode > 2) g_mode = 2;
+    ComputeVirtualCanvas();
 
     // If the ini doesn't exist yet, write out defaults so the user has
     // something to edit next time.
@@ -134,6 +185,8 @@ static void LoadConfig()
         WritePrivateProfileStringA("Settings", "ForceFullViewport", "0", INI_NAME);
         WritePrivateProfileStringA("Settings", "LogResourceCalls", "0", INI_NAME);
         WritePrivateProfileStringA("Settings", "Recon", "1", INI_NAME);
+        WritePrivateProfileStringA("Settings", "Mode", "2", INI_NAME);
+        WritePrivateProfileStringA("Settings", "Keep43Backdrops", "1", INI_NAME);
     }
 }
 
@@ -195,16 +248,28 @@ static SetViewport_t oSetViewport = nullptr;
 
 long __fastcall hkSetViewport(void* pThis, void* /*edx*/, DWORD x, DWORD y, DWORD w, DWORD h)
 {
-    if (g_forceViewport)
+    long r;
+    if (g_mode != 0)
+    {
+        // Agl7 keeps seeing the VIRTUAL viewport; the real Direct3D viewport is forced
+        // to the full surface in hkD3DSetViewport.
+        static int n = 0;
+        if (n++ < 5)
+            Log("[SetViewport] game requested (%u,%u,%u,%u) -> virtual (0,0,%d,%d)\n", x, y, w, h, g_virtW, g_virtH);
+        r = oSetViewport(pThis, 0, 0, (DWORD)g_virtW, (DWORD)g_virtH);
+    }
+    else if (g_forceViewport)
     {
         Log("[SetViewport] game requested (%u,%u,%u,%u) -> forcing (0,0,%d,%d)\n",
             x, y, w, h, g_targetWidth, g_targetHeight);
-        long r = oSetViewport(pThis, 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight);
-        TryHookDevice(pThis);
-        return r;
+        r = oSetViewport(pThis, 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight);
     }
-    long r = oSetViewport(pThis, x, y, w, h);
+    else
+    {
+        r = oSetViewport(pThis, x, y, w, h);
+    }
     TryHookDevice(pThis);
+    ApplyVirtualScreen();
     return r;
 }
 
@@ -261,6 +326,7 @@ void* __fastcall hkCreateImage(void* pThis, void* /*edx*/, DWORD w, DWORD h, BYT
 {
     void* result = oCreateImage(pThis, w, h, type, flags);
     TryHookDevice(pThis);
+    ApplyVirtualScreen();
     if (g_logResources)
     {
         if (!result && oAGLGetLastError)
@@ -420,9 +486,46 @@ static void ReconFrameSummary()
     g_triBox[2] = g_quadBox[2] = 1e9f;  g_triBox[3] = g_quadBox[3] = -1e9f;
 }
 
+// Scale pre-transformed (XYZRHW) vertices from the game's virtual canvas to the real surface.
+static void RemapVertices(BYTE* buf, DWORD count, DWORD stride, DWORD fvf)
+{
+    float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f;
+    DWORD i;
+    for (i = 0; i < count; i++)
+    {
+        const float* v = (const float*)(buf + i * stride);
+        if (v[0] < minx) minx = v[0];
+        if (v[0] > maxx) maxx = v[0];
+        if (v[1] < miny) miny = v[1];
+        if (v[1] > maxy) maxy = v[1];
+    }
+    // mode 1: a textured quad covering the whole virtual screen is a 4:3 backdrop
+    // (menu / loading / title art) - keep its shape instead of stretching it.
+    bool backdrop = (g_mode == 1) && g_keep43 && (count == 4) && ((fvf & 0x100) != 0) &&
+                    minx <= 3.0f && miny <= 3.0f &&
+                    maxx >= (float)g_virtW - 3.0f && maxy >= (float)g_virtH - 3.0f;
+    for (i = 0; i < count; i++)
+    {
+        float* v = (float*)(buf + i * stride);
+        if (backdrop) { v[0] = g_off43 + v[0] * g_scale43x; v[1] = g_offY43 + v[1] * g_scale43y; }
+        else          { v[0] = g_offX  + v[0] * g_scale;    v[1] = g_offY  + v[1] * g_scale; }
+    }
+}
+
 static HRESULT WINAPI hkDrawPrimitive(void* dev, DWORD type, DWORD fvf, void* verts, DWORD count, DWORD flags)
 {
     if (g_recon) ReconDraw(type, fvf, verts, count);
+    if (g_mode != 0 && verts && count != 0 && count <= 64 && (fvf & 0x00E) == 0x004)
+    {
+        DWORD stride = FvfStride(fvf);
+        if (stride >= 16 && stride <= 80)
+        {
+            BYTE buf[64 * 80];                       // work on a copy: the game may reuse its buffer
+            memcpy(buf, verts, count * stride);
+            RemapVertices(buf, count, stride, fvf);
+            return oDrawPrimitive(dev, type, fvf, buf, count, flags);
+        }
+    }
     return oDrawPrimitive(dev, type, fvf, verts, count, flags);
 }
 
@@ -436,6 +539,14 @@ static HRESULT WINAPI hkD3DSetViewport(void* dev, D3DVIEWPORT7_* vp)
             last = *vp;
             Log("[D3D SetViewport] x=%u y=%u w=%u h=%u z=[%.2f .. %.2f]\n", vp->x, vp->y, vp->w, vp->h, vp->minZ, vp->maxZ);
         }
+    }
+    if (g_mode != 0 && vp)
+    {
+        D3DVIEWPORT7_ v = *vp;
+        v.x = 0; v.y = 0; v.w = (DWORD)g_targetWidth; v.h = (DWORD)g_targetHeight;
+        static bool once = false;
+        if (!once) { once = true; Log("[D3D SetViewport] virtual mode: forcing the real viewport 0,0,%d,%d\n", g_targetWidth, g_targetHeight); }
+        return oD3DSetViewport(dev, &v);
     }
     return oD3DSetViewport(dev, vp);
 }
@@ -468,7 +579,7 @@ static bool ReadPtrSafe(const void* addr, void** out)
 // functions - only once, since every device uses the same implementations.
 static void TryHookDevice(void* screen)
 {
-    if (!g_recon || !screen || g_hookedDrawFn) return;
+    if ((!g_recon && g_mode == 0) || !screen || g_hookedDrawFn) return;
 
     void* dev = nullptr;
     if (!ReadPtrSafe((const BYTE*)screen + 0x160, &dev) || !dev) return;
@@ -495,6 +606,68 @@ static void TryHookDevice(void* screen)
     { MH_EnableHook(fnVp); Log("[D3D] hooked SetViewport\n"); }
     if (fnTr && MH_CreateHook(fnTr, (LPVOID)&hkD3DSetTransform, (LPVOID*)&oD3DSetTransform) == MH_OK)
     { MH_EnableHook(fnTr); Log("[D3D] hooked SetTransform\n"); }
+
+    // Agl7 already issued its first SetViewport (with the virtual size) before we could hook
+    // the device, so set the real full-surface viewport ourselves once.
+    if (g_mode != 0 && oD3DSetViewport)
+    {
+        D3DVIEWPORT7_ v = { 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight, 0.0f, 1.0f };
+        HRESULT hr = oD3DSetViewport(dev, &v);
+        Log("[D3D] initial real viewport 0,0,%d,%d -> hr=0x%08X\n", g_targetWidth, g_targetHeight, (unsigned)hr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VIRTUAL CANVAS helpers (v1.3)
+// ---------------------------------------------------------------------------
+// exe global at VA 0x443d44 (RVA 0x43d44) points to a context struct whose +8/+0xC
+// are the screen width/height used by all layout code (77 read sites). Tied to this
+// exact exe build; we sanity-check the values before writing.
+static bool PokeCtxDims(void* ctx, DWORD w, DWORD h, DWORD* oldW, DWORD* oldH)
+{
+    __try
+    {
+        DWORD* p = (DWORD*)((BYTE*)ctx + 8);
+        *oldW = p[0]; *oldH = p[1];
+        if (p[0] == w && p[1] == h) return true;
+        if (p[0] < 320 || p[0] > 8192 || p[1] < 240 || p[1] > 8192) return false;   // not what we expect
+        p[0] = w; p[1] = h;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static void ApplyVirtualScreen()
+{
+    if (g_mode == 0) return;
+    BYTE* exeBase = (BYTE*)GetModuleHandleA(NULL);
+    void* ctx = nullptr;
+    if (!exeBase || !ReadPtrSafe(exeBase + 0x43d44, &ctx) || !ctx) return;     // not created yet
+    DWORD ow = 0, oh = 0;
+    bool ok = PokeCtxDims(ctx, (DWORD)g_virtW, (DWORD)g_virtH, &ow, &oh);
+    static bool logged = false;
+    static int  fails = 0;
+    if (ok && !logged && (ow != (DWORD)g_virtW || oh != (DWORD)g_virtH))
+    {
+        logged = true;
+        Log("[Virtual] screen context %p: %ux%u -> %dx%d (mode %d, scale %.4f, offset %.1f,%.1f)\n",
+            ctx, ow, oh, g_virtW, g_virtH, g_mode, g_scale, g_offX, g_offY);
+    }
+    else if (!ok && !(ow == 0 && oh == 0) && fails++ < 3)      // 0x0 = exe has not stored the size yet
+        Log("[Virtual] could not patch screen context %p (dims %ux%u) - unexpected values, skipped\n", ctx, ow, oh);
+}
+
+typedef HRESULT (WINAPI *D3DClear_t)(void* dev, DWORD cnt, void* rects, DWORD flags, DWORD color, float z, DWORD stencil);
+
+// Black out the back buffer after each Flip so the bars never show stale pixels.
+static void ClearBackBuffer(void* screen)
+{
+    if (!g_clearBars || !screen) return;
+    void* dev = nullptr; void** vtbl = nullptr; void* fn = nullptr;
+    if (!ReadPtrSafe((const BYTE*)screen + 0x160, &dev) || !dev) return;
+    if (!ReadPtrSafe(dev, (void**)&vtbl) || !vtbl) return;
+    if (!ReadPtrSafe(&vtbl[10], &fn) || !fn) return;                            // slot 10 = Clear
+    ((D3DClear_t)fn)(dev, 0, NULL, 1 /*D3DCLEAR_TARGET*/, 0xFF000000, 1.0f, 0);
 }
 
 // AGLSCREEN::Flip (called once per frame) - a reliable place to discover the device.
@@ -504,7 +677,10 @@ long __fastcall hkFlip(void* pThis, void* /*edx*/, long a, long b)
 {
     ReconFrameSummary();
     TryHookDevice(pThis);
-    return oFlip(pThis, a, b);
+    ApplyVirtualScreen();
+    long r = oFlip(pThis, a, b);
+    ClearBackBuffer(pThis);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -574,11 +750,11 @@ static void PatchSkyRectangleEntity()
     // RVA 0x20606 = "68 e0 01 00 00" (push 0x1e0 / 480) - the immediate
     // operand is the 4 bytes AFTER the 0x68 push opcode, i.e. RVA+1.
     PatchImmediateIfMatches(exeBase, 0x20607, (DWORD)ORIG_CLIENT_HEIGHT,
-                             (DWORD)g_targetHeight, "sky-rect height");
+                             (DWORD)(g_mode != 0 ? g_virtH : g_targetHeight), "sky-rect height");
 
     // RVA 0x2060b = "68 80 02 00 00" (push 0x280 / 640), same pattern.
     PatchImmediateIfMatches(exeBase, 0x2060c, (DWORD)ORIG_CLIENT_WIDTH,
-                             (DWORD)g_targetWidth, "sky-rect width");
+                             (DWORD)(g_mode != 0 ? g_virtW : g_targetWidth), "sky-rect width");
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +855,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         LogInit();
         LoadConfig();
-        Log("PPWidescreenFix loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
+        Log("PPWidescreenFix v1.3 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
+        Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f  offset=(%.1f,%.1f)  keep43=%d  clearBars=%d\n",
+            g_mode, g_virtW, g_virtH, g_scale, g_offX, g_offY, (int)g_keep43, (int)g_clearBars);
         InstallHooks();
     }
     else if (reason == DLL_PROCESS_DETACH)
