@@ -1,5 +1,5 @@
 // ============================================================================
-// PPWidescreenFix v1.1 - Native resolution plugin for
+// PPWidescreenFix v1.2 (RECON build) - Native resolution plugin for
 //   Pink Panther: Pinkadelic Pursuit (2002)
 //   v1.0 ENGLISH No-CD/Fixed EXE
 //
@@ -84,11 +84,15 @@ static int  g_targetHeight  = 1080;
 static bool g_forceViewport = true;
 static bool g_logResources  = false;
 static bool g_logToFile     = true;
+static bool g_recon         = true;   // log what the game sends to Direct3D (no behaviour change)
 
 static const int ORIG_CLIENT_WIDTH  = 640;
 static const int ORIG_CLIENT_HEIGHT = 480;
 
 static FILE* g_log = nullptr;
+
+// defined in the RECON section below; the AGLSCREEN hooks call it
+static void TryHookDevice(void* screen);
 
 static void LogInit()
 {
@@ -117,8 +121,9 @@ static void LoadConfig()
 
     g_targetWidth   = GetPrivateProfileIntA("Settings", "Width", 1920, INI_NAME);
     g_targetHeight  = GetPrivateProfileIntA("Settings", "Height", 1080, INI_NAME);
-    g_forceViewport = GetPrivateProfileIntA("Settings", "ForceFullViewport", 1, INI_NAME) != 0;
+    g_forceViewport = GetPrivateProfileIntA("Settings", "ForceFullViewport", 0, INI_NAME) != 0;
     g_logResources  = GetPrivateProfileIntA("Settings", "LogResourceCalls", 0, INI_NAME) != 0;
+    g_recon         = GetPrivateProfileIntA("Settings", "Recon", 1, INI_NAME) != 0;
 
     // If the ini doesn't exist yet, write out defaults so the user has
     // something to edit next time.
@@ -126,8 +131,9 @@ static void LoadConfig()
     {
         WritePrivateProfileStringA("Settings", "Width", "1920", INI_NAME);
         WritePrivateProfileStringA("Settings", "Height", "1080", INI_NAME);
-        WritePrivateProfileStringA("Settings", "ForceFullViewport", "1", INI_NAME);
+        WritePrivateProfileStringA("Settings", "ForceFullViewport", "0", INI_NAME);
         WritePrivateProfileStringA("Settings", "LogResourceCalls", "0", INI_NAME);
+        WritePrivateProfileStringA("Settings", "Recon", "1", INI_NAME);
     }
 }
 
@@ -187,15 +193,19 @@ BOOL WINAPI hkAdjustWindowRectEx(LPRECT lpRect, DWORD dwStyle, BOOL bMenu, DWORD
 typedef long (__thiscall *SetViewport_t)(void* pThis, DWORD x, DWORD y, DWORD w, DWORD h);
 static SetViewport_t oSetViewport = nullptr;
 
-long __fastcall hkSetViewport(void* pThis, void* /*unused*/, DWORD x, DWORD y, DWORD w, DWORD h)
+long __fastcall hkSetViewport(void* pThis, void* /*edx*/, DWORD x, DWORD y, DWORD w, DWORD h)
 {
     if (g_forceViewport)
     {
         Log("[SetViewport] game requested (%u,%u,%u,%u) -> forcing (0,0,%d,%d)\n",
             x, y, w, h, g_targetWidth, g_targetHeight);
-        return oSetViewport(pThis, 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight);
+        long r = oSetViewport(pThis, 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight);
+        TryHookDevice(pThis);
+        return r;
     }
-    return oSetViewport(pThis, x, y, w, h);
+    long r = oSetViewport(pThis, x, y, w, h);
+    TryHookDevice(pThis);
+    return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +219,7 @@ long __fastcall hkSetViewport(void* pThis, void* /*unused*/, DWORD x, DWORD y, D
 typedef long (__thiscall *SetDisplayMode_t)(void* pThis, DWORD width, DWORD height, BYTE bpp, BYTE flag);
 static SetDisplayMode_t oSetDisplayMode = nullptr;
 
-long __fastcall hkSetDisplayMode(void* pThis, void* /*unused*/, DWORD width, DWORD height, BYTE bpp, BYTE flag)
+long __fastcall hkSetDisplayMode(void* pThis, void* /*edx*/, DWORD width, DWORD height, BYTE bpp, BYTE flag)
 {
     Log("[SetDisplayMode] width=%u height=%u bpp=%u flag=%u\n", width, height, bpp, flag);
 
@@ -225,6 +235,7 @@ long __fastcall hkSetDisplayMode(void* pThis, void* /*unused*/, DWORD width, DWO
 
     long result = oSetDisplayMode(pThis, width, height, bpp, flag);
     Log("[SetDisplayMode] result = %ld\n", result);
+    TryHookDevice(pThis);
     return result;
 }
 
@@ -246,9 +257,10 @@ static CreateImage_t oCreateImage = nullptr;
 typedef long (WINAPI *AGLGetLastError_t)();
 static AGLGetLastError_t oAGLGetLastError = nullptr;
 
-void* __fastcall hkCreateImage(void* pThis, void* /*unused*/, DWORD w, DWORD h, BYTE type, WORD flags)
+void* __fastcall hkCreateImage(void* pThis, void* /*edx*/, DWORD w, DWORD h, BYTE type, WORD flags)
 {
     void* result = oCreateImage(pThis, w, h, type, flags);
+    TryHookDevice(pThis);
     if (g_logResources)
     {
         if (!result && oAGLGetLastError)
@@ -263,6 +275,236 @@ void* __fastcall hkCreateImage(void* pThis, void* /*unused*/, DWORD w, DWORD h, 
         }
     }
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// RECON: Direct3D 7 device hooks (v1.2) - LOGGING ONLY, no behaviour change
+// ---------------------------------------------------------------------------
+// FINDINGS THAT MOTIVATE THIS (verified in the binaries):
+//  * Agl7.dll creates a Direct3D 7 HAL device on the back buffer
+//    (IDirect3D7::CreateDevice with IID_IDirect3DHALDevice) and stores the
+//    IDirect3DDevice7* at AGLSCREEN+0x160.
+//  * The exe renders through that device: BeginScene/EndScene around a
+//    display-list loop, and 12 DrawPrimitive call sites whose FVF is 0x44 or
+//    0x144 = XYZRHW|DIFFUSE(|TEX1). XYZRHW = pre-transformed vertices in
+//    SCREEN PIXEL coordinates, computed by the exe. That covers the HUD, text,
+//    menu backdrops and the "sky" rectangle.
+// So the right place to fix HUD/menu placement is IDirect3DDevice7::DrawPrimitive.
+// Before writing remap rules we need to SEE what pixel ranges are used at the
+// new resolution - this build only logs that. Send PPWidescreenFix.log back.
+//
+// IDirect3DDevice7 vtable slots used: 11 SetTransform, 13 SetViewport,
+// 25 DrawPrimitive (slot 25 = offset 0x64, matching the exe's call sites).
+struct D3DVIEWPORT7_ { DWORD x, y, w, h; float minZ, maxZ; };
+
+typedef HRESULT (WINAPI *DrawPrimitive_t)(void* dev, DWORD type, DWORD fvf, void* verts, DWORD count, DWORD flags);
+typedef HRESULT (WINAPI *D3DSetViewport_t)(void* dev, D3DVIEWPORT7_* vp);
+typedef HRESULT (WINAPI *D3DSetTransform_t)(void* dev, DWORD state, const float* m);
+static DrawPrimitive_t    oDrawPrimitive    = nullptr;
+static D3DSetViewport_t   oD3DSetViewport   = nullptr;
+static D3DSetTransform_t  oD3DSetTransform  = nullptr;
+
+static void* g_hookedDrawFn = nullptr;     // DrawPrimitive implementation we already hooked
+static int   g_budgetQuad   = 1200;        // distinct quad shapes to log   (count==4: sprites / HUD / rectangles)
+static int   g_budgetTri    = 250;         // distinct triangle shapes to log (count==3: usually the 3D scene)
+static int   g_budgetOther  = 100;         // distinct non-pre-transformed shapes
+static int   g_summaryBudget = 60;         // per-interval summary lines
+static unsigned int g_cntTri = 0, g_cntQuad = 0, g_cntOther = 0;
+static float g_triBox[4]  = { 1e9f, -1e9f, 1e9f, -1e9f };   // minx maxx miny maxy
+static float g_quadBox[4] = { 1e9f, -1e9f, 1e9f, -1e9f };
+
+// tiny "have I logged this exact shape already?" set (open addressing, 0 = empty)
+static unsigned int g_sigTable[4096];
+static bool SeenBefore(unsigned int h)
+{
+    if (h == 0) h = 1;
+    unsigned int idx = h & 4095;
+    for (int i = 0; i < 4096; i++)
+    {
+        unsigned int j = (idx + i) & 4095;
+        if (g_sigTable[j] == h) return true;
+        if (g_sigTable[j] == 0) { g_sigTable[j] = h; return false; }
+    }
+    return true; // table full: stop logging new shapes
+}
+static unsigned int Mix(unsigned int h, unsigned int v) { return (h ^ v) * 16777619u; }
+
+static DWORD FvfStride(DWORD fvf)
+{
+    DWORD s = 0;
+    DWORD pos = fvf & 0x00E;                       // D3DFVF_POSITION_MASK
+    if (pos == 0x004)      s += 16;                // XYZRHW
+    else if (pos == 0x002) s += 12;                // XYZ
+    else return 0;                                 // blend-weight formats: not handled
+    if (fvf & 0x010) s += 12;                      // normal
+    if (fvf & 0x020) s += 4;                       // reserved / point size
+    if (fvf & 0x040) s += 4;                       // diffuse
+    if (fvf & 0x080) s += 4;                       // specular
+    s += ((fvf >> 8) & 0xF) * 8;                   // texture coordinate sets (2 floats each)
+    return s;
+}
+
+// Separate function so the SEH guard has no C++ objects to unwind.
+static void ReconDraw(DWORD type, DWORD fvf, void* verts, DWORD count)
+{
+    __try
+    {
+        if (!verts || count == 0 || count > 64) return;
+        DWORD stride = FvfStride(fvf);
+        bool tl = ((fvf & 0x00E) == 0x004) && stride >= 16;   // XYZRHW = pixel-space vertices
+
+        if (!tl)
+        {
+            g_cntOther++;
+            if (g_budgetOther > 0)
+            {
+                unsigned int h = Mix(Mix(Mix(2166136261u, type), fvf), count);
+                if (!SeenBefore(h))
+                {
+                    g_budgetOther--;
+                    Log("[DP] prim=%u fvf=0x%X n=%u  (not pre-transformed)\n", type, fvf, count);
+                }
+            }
+            return;
+        }
+
+        float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, rhw = 0.0f, z = 0.0f;
+        const BYTE* p = (const BYTE*)verts;
+        for (DWORD i = 0; i < count; i++)
+        {
+            const float* v = (const float*)(p + i * stride);
+            if (v[0] < minx) minx = v[0];
+            if (v[0] > maxx) maxx = v[0];
+            if (v[1] < miny) miny = v[1];
+            if (v[1] > maxy) maxy = v[1];
+            z = v[2]; rhw = v[3];
+        }
+
+        bool quad = (count == 4);
+        float* box = quad ? g_quadBox : g_triBox;
+        if (quad) g_cntQuad++; else g_cntTri++;
+        if (minx < box[0]) box[0] = minx;
+        if (maxx > box[1]) box[1] = maxx;
+        if (miny < box[2]) box[2] = miny;
+        if (maxy > box[3]) box[3] = maxy;
+
+        int* budget = quad ? &g_budgetQuad : &g_budgetTri;
+        if (*budget <= 0) return;
+        float q = quad ? 16.0f : 64.0f;          // coarser grid for triangles so they don't flood the log
+        unsigned int h = 2166136261u;
+        h = Mix(h, type); h = Mix(h, fvf); h = Mix(h, count);
+        h = Mix(h, (unsigned int)(int)(minx / q)); h = Mix(h, (unsigned int)(int)(maxx / q));
+        h = Mix(h, (unsigned int)(int)(miny / q)); h = Mix(h, (unsigned int)(int)(maxy / q));
+        if (SeenBefore(h)) return;
+        (*budget)--;
+        Log("[DP] prim=%u fvf=0x%X n=%u  x[%.1f .. %.1f]  y[%.1f .. %.1f]  z=%.3f rhw=%.3f\n",
+            type, fvf, count, minx, maxx, miny, maxy, z, rhw);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// Every 120 frames: how many draws of each kind, and the overall pixel extents of
+// 2D quads vs triangles. Tells us the coordinate range the game really uses.
+static void ReconFrameSummary()
+{
+    static int frames = 0;
+    if (!g_recon) return;
+    if (++frames % 120 != 0 || g_summaryBudget <= 0) return;
+    g_summaryBudget--;
+    Log("[FRAMES %d] tri=%u quad=%u other=%u | tri x[%.0f..%.0f] y[%.0f..%.0f] | quad x[%.0f..%.0f] y[%.0f..%.0f]\n",
+        frames, g_cntTri, g_cntQuad, g_cntOther,
+        g_triBox[0], g_triBox[1], g_triBox[2], g_triBox[3],
+        g_quadBox[0], g_quadBox[1], g_quadBox[2], g_quadBox[3]);
+    g_cntTri = g_cntQuad = g_cntOther = 0;
+    g_triBox[0] = g_quadBox[0] = 1e9f;  g_triBox[1] = g_quadBox[1] = -1e9f;
+    g_triBox[2] = g_quadBox[2] = 1e9f;  g_triBox[3] = g_quadBox[3] = -1e9f;
+}
+
+static HRESULT WINAPI hkDrawPrimitive(void* dev, DWORD type, DWORD fvf, void* verts, DWORD count, DWORD flags)
+{
+    if (g_recon) ReconDraw(type, fvf, verts, count);
+    return oDrawPrimitive(dev, type, fvf, verts, count, flags);
+}
+
+static HRESULT WINAPI hkD3DSetViewport(void* dev, D3DVIEWPORT7_* vp)
+{
+    if (g_recon && vp)
+    {
+        static D3DVIEWPORT7_ last = { 0xFFFFFFFF, 0, 0, 0, 0, 0 };
+        if (memcmp(&last, vp, sizeof(last)) != 0)
+        {
+            last = *vp;
+            Log("[D3D SetViewport] x=%u y=%u w=%u h=%u z=[%.2f .. %.2f]\n", vp->x, vp->y, vp->w, vp->h, vp->minZ, vp->maxZ);
+        }
+    }
+    return oD3DSetViewport(dev, vp);
+}
+
+static HRESULT WINAPI hkD3DSetTransform(void* dev, DWORD state, const float* m)
+{
+    if (g_recon && m && state == 3)   // D3DTRANSFORMSTATE_PROJECTION
+    {
+        static float last[16];
+        static int budget = 60;
+        if (budget > 0 && memcmp(last, m, sizeof(last)) != 0)
+        {
+            memcpy(last, m, sizeof(last));
+            budget--;
+            Log("[D3D SetTransform PROJECTION] _11=%.4f _22=%.4f _33=%.4f _43=%.4f _34=%.4f\n",
+                m[0], m[5], m[10], m[14], m[11]);
+        }
+    }
+    return oD3DSetTransform(dev, state, m);
+}
+
+static bool ReadPtrSafe(const void* addr, void** out)
+{
+    __try { *out = *(void* const*)addr; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Called from every AGLSCREEN hook (they all receive the AGLSCREEN* as 'this').
+// Once Agl7 has created the device (AGLSCREEN+0x160) we patch the shared vtable
+// functions - only once, since every device uses the same implementations.
+static void TryHookDevice(void* screen)
+{
+    if (!g_recon || !screen || g_hookedDrawFn) return;
+
+    void* dev = nullptr;
+    if (!ReadPtrSafe((const BYTE*)screen + 0x160, &dev) || !dev) return;
+    void** vtbl = nullptr;
+    if (!ReadPtrSafe(dev, (void**)&vtbl) || !vtbl) return;
+
+    void* fnDraw = nullptr; void* fnVp = nullptr; void* fnTr = nullptr;
+    if (!ReadPtrSafe(&vtbl[25], &fnDraw) || !fnDraw) return;
+    ReadPtrSafe(&vtbl[13], &fnVp);
+    ReadPtrSafe(&vtbl[11], &fnTr);
+
+    Log("[D3D] device found at %p (vtable %p): DrawPrimitive=%p SetViewport=%p SetTransform=%p\n",
+        dev, (void*)vtbl, fnDraw, fnVp, fnTr);
+
+    if (MH_CreateHook(fnDraw, (LPVOID)&hkDrawPrimitive, (LPVOID*)&oDrawPrimitive) == MH_OK)
+    {
+        MH_EnableHook(fnDraw);
+        g_hookedDrawFn = fnDraw;
+        Log("[D3D] hooked DrawPrimitive\n");
+    }
+    else Log("[D3D] FAILED to hook DrawPrimitive\n");
+
+    if (fnVp && MH_CreateHook(fnVp, (LPVOID)&hkD3DSetViewport, (LPVOID*)&oD3DSetViewport) == MH_OK)
+    { MH_EnableHook(fnVp); Log("[D3D] hooked SetViewport\n"); }
+    if (fnTr && MH_CreateHook(fnTr, (LPVOID)&hkD3DSetTransform, (LPVOID*)&oD3DSetTransform) == MH_OK)
+    { MH_EnableHook(fnTr); Log("[D3D] hooked SetTransform\n"); }
+}
+
+// AGLSCREEN::Flip (called once per frame) - a reliable place to discover the device.
+typedef long (__thiscall *Flip_t)(void* pThis, long a, long b);
+static Flip_t oFlip = nullptr;
+long __fastcall hkFlip(void* pThis, void* /*edx*/, long a, long b)
+{
+    ReconFrameSummary();
+    TryHookDevice(pThis);
+    return oFlip(pThis, a, b);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +645,17 @@ static void InstallHooks()
         else
         {
             Log("FAILED to hook AGLSCREEN::CreateImage (export not found?)\n");
+        }
+
+        void* pFlip = GetProcAddress(hAgl, "?Flip@AGLSCREEN@@QAEJJJ@Z");
+        if (pFlip && MH_CreateHook(pFlip, (LPVOID)&hkFlip, (void**)&oFlip) == MH_OK)
+        {
+            MH_EnableHook(pFlip);
+            Log("Hooked AGLSCREEN::Flip (device discovery)\n");
+        }
+        else
+        {
+            Log("FAILED to hook AGLSCREEN::Flip\n");
         }
 
         oAGLGetLastError = (AGLGetLastError_t)GetProcAddress(hAgl, "?AGLGetLastError@@YAJXZ");
