@@ -1,5 +1,5 @@
 // ============================================================================
-// PPWidescreenFix v1.4 - native resolution / widescreen plugin for
+// PPWidescreenFix v1.5 - native resolution / widescreen plugin for
 //   Pink Panther: Pinkadelic Pursuit (2002)  -  v1.0 ENGLISH No-CD/Fixed EXE
 //
 // HOW THE GAME RENDERS (verified from the binaries and from the v1.2/v1.3 logs)
@@ -11,41 +11,37 @@
 //    the 3D world, which the game projects in software (focal length is the
 //    constant 479.0, centre = viewport size / 2, so a wider canvas = Hor+).
 //  * Layout code reads the screen size from a context struct (exe VA 0x443d44,
-//    +8 width, +0xC height). The game's own D3D viewport is ALWAYS the full
-//    context rectangle, and the game does not clip polygons itself: polygons
-//    that stick out of the screen (x down to -580, up to +1200 ...) were cut off
-//    by the D3D viewport. THIS is what v1.3 broke (see v1.4 below).
+//    +8 width, +0xC height): text is centred on width/2, some HUD items are
+//    anchored to width - N, others sit at fixed positions on the left.
+//  * The game's own D3D viewport is ALWAYS the full context rectangle, and the
+//    game does not clip polygons itself: polygons that stick out of the screen
+//    (x from about -580 to +1200 ...) were cut off by the D3D viewport.
 //
 // WHAT THE PLUGIN DOES
 // -----------------------------------------------------------------------------
 //  1. AdjustWindowRectEx hook: the 640x480 client rect becomes the real size.
 //  2. A VIRTUAL CANVAS: the exe lays everything out on a virtual size stored in
 //     its context struct; every pre-transformed vertex is scaled to the real
-//     surface inside the DrawPrimitive hook. Everything stays consistent.
+//     surface inside the DrawPrimitive hook, so the whole game stays consistent.
+//        Mode 1 = (default) virtual canvas with the aspect ratio of the screen
+//                 (853x480 at 16:9) that fills the screen: TRUE WIDESCREEN (Hor+),
+//                 no black bars. Full-screen 4:3 pictures (loading / title / menu
+//                 art) are stretched to the screen (BackdropFit=1) or keep their
+//                 4:3 shape with black bars (BackdropFit=0).
+//        Mode 2 = virtual 640x480 canvas, centred with black bars (pillarbox) -
+//                 the original game, useful as a reference.
 //        Mode 0 = off (resolution patch only)
-//        Mode 1 = virtual canvas with the screen's aspect (853x480 at 16:9):
-//                 TRUE WIDESCREEN (Hor+)
-//        Mode 2 = virtual 640x480 canvas, centred with black bars (pillarbox)
-//
-// v1.4 CHANGES
-// -----------------------------------------------------------------------------
-//  * CLIPPING (the main fix): v1.3 forced the real D3D viewport to the whole
-//    surface, so the geometry that the original viewport used to cut off was
-//    drawn into the black bars (and, in mode 1, outside the canvas). Now every
-//    triangle/quad is clipped to the virtual canvas on the CPU before it is
-//    scaled (perspective-correct for texture coordinates, linear for colour).
-//    Independent of how Direct3D treats the viewport for XYZRHW vertices.
-//  * The virtual size is applied EARLY: right after SetDisplayMode the exe stores the
-//    REAL size in its context struct (VA 0x402c2f/0x402c37) and the next Direct3D
-//    call it makes is IDirect3DDevice7::SetTextureStageState (VA 0x402cf1). The plugin
-//    hooks that call and overwrites the struct with the virtual size right there.
-//    v1.3 patched the struct only on the next Agl7 hook call, so entities built in
-//    between (loading / title backdrops) kept REAL-size coordinates. A safety net in
-//    the draw hook also normalises any full-screen quad that still has real-size
-//    coordinates.
-//  * Mode 1: 4:3 screens (menus, loading) - the full-screen art AND the UI drawn
-//    on top of it (positioned for 640x480) are placed together, centred.
-//  * Configurable: ClipToCanvas, Keep43Backdrops, Keep43UI.
+//  3. CLIPPING: every pre-transformed triangle/quad is clipped to the virtual
+//     canvas on the CPU before it is scaled (perspective-correct texture
+//     coordinates, linear colour) - this replaces the clipping that the original
+//     640x480 D3D viewport used to do. (v1.3 forced the viewport to the whole
+//     surface without clipping, so off-screen geometry showed up in the bars.)
+//  4. The virtual size is applied EARLY: right after SetDisplayMode the exe stores
+//     the REAL size in its context struct (VA 0x402c2f/0x402c37) and the next
+//     Direct3D call it makes is IDirect3DDevice7::SetTextureStageState (VA
+//     0x402cf1); the plugin hooks that call and overwrites the struct right there,
+//     before any entity can capture the real size. A safety net in the draw hook
+//     also normalises any full-screen quad that still has real-size coordinates.
 //
 // NOTE: several patches/addresses are tied to this exact exe build; they are
 // verified before anything is written.
@@ -70,13 +66,12 @@ static bool g_logToFile     = true;
 static bool g_recon         = true;   // log what the game sends to Direct3D (no behaviour change)
 
 //   Mode 0 = off, Mode 1 = widescreen (Hor+), Mode 2 = 640x480 pillarbox
-static int   g_mode          = 2;
-static bool  g_keep43        = true;   // mode 1: 4:3 backdrops stay 4:3
-static bool  g_keep43UI      = true;   // mode 1: UI drawn over a 4:3 backdrop is placed with it
+static int   g_mode          = 1;
+static int   g_backdropFit   = 1;      // mode 1, full-screen 4:3 pictures: 0 = keep 4:3 (black bars), 1 = stretch to the screen
 static bool  g_clipToCanvas  = true;   // clip all pre-transformed primitives to the virtual canvas
 static int   g_virtW         = 640, g_virtH = 480;
-static float g_scale         = 1.0f, g_offX = 0.0f, g_offY = 0.0f;
-static float g_off43         = 0.0f, g_offY43 = 0.0f, g_scale43x = 1.0f, g_scale43y = 1.0f;
+static float g_scaleX        = 1.0f, g_scaleY = 1.0f, g_offX = 0.0f, g_offY = 0.0f;   // virtual canvas -> real surface
+static float g_off43         = 0.0f, g_offY43 = 0.0f, g_scale43x = 1.0f, g_scale43y = 1.0f;   // 4:3 placement (BackdropFit=0)
 static bool  g_clearBars     = false;
 
 static const int ORIG_CLIENT_WIDTH  = 640;
@@ -112,27 +107,30 @@ static void ComputeVirtualCanvas()
     g_virtH = 480;
     if (g_mode == 1)
     {
-        g_scale = H / 480.0f;
+        // virtual canvas with the aspect ratio of the screen; it fills the screen exactly
+        // (the two scale factors differ by well under 0.1%, which is invisible)
         g_virtW = (int)(480.0 * g_targetWidth / g_targetHeight + 0.5);
         if (g_virtW < 640) g_virtW = 640;
-        g_offX = (W - g_virtW * g_scale) * 0.5f;
+        g_scaleX = W / (float)g_virtW;
+        g_scaleY = H / 480.0f;
+        g_offX = 0.0f;
         g_offY = 0.0f;
     }
     else
     {
         g_virtW = 640;
         float sx = W / 640.0f, sy = H / 480.0f;
-        g_scale = (sx < sy) ? sx : sy;
-        g_offX = (W - 640.0f * g_scale) * 0.5f;
-        g_offY = (H - 480.0f * g_scale) * 0.5f;
+        g_scaleX = g_scaleY = (sx < sy) ? sx : sy;
+        g_offX = (W - 640.0f * g_scaleX) * 0.5f;
+        g_offY = (H - 480.0f * g_scaleY) * 0.5f;
     }
-    // where a 4:3 picture goes when it must keep its shape (mode 1 menus / loading screens)
+    // where a full-screen 4:3 picture goes when it must keep its shape (mode 1, BackdropFit=0)
     float s43 = (W / 640.0f < H / 480.0f) ? (W / 640.0f) : (H / 480.0f);
     g_off43    = (W - 640.0f * s43) * 0.5f;
     g_offY43   = (H - 480.0f * s43) * 0.5f;
-    g_scale43x = (640.0f * s43) / (float)g_virtW;   // full-canvas quad -> the 4:3 area
-    g_scale43y = s43;                               // also the uniform scale for 640x480-space UI
-    g_clearBars = (g_mode == 2) || (g_mode == 1 && g_keep43);
+    g_scale43x = (640.0f * s43) / (float)g_virtW;
+    g_scale43y = s43;
+    g_clearBars = (g_mode == 2) || (g_mode == 1 && g_backdropFit == 0);
 }
 
 static void LoadConfig()
@@ -144,11 +142,11 @@ static void LoadConfig()
     g_forceViewport = GetPrivateProfileIntA("Settings", "ForceFullViewport", 0, INI_NAME) != 0;
     g_logResources  = GetPrivateProfileIntA("Settings", "LogResourceCalls", 0, INI_NAME) != 0;
     g_recon         = GetPrivateProfileIntA("Settings", "Recon", 1, INI_NAME) != 0;
-    g_mode          = GetPrivateProfileIntA("Settings", "Mode", 2, INI_NAME);
-    g_keep43        = GetPrivateProfileIntA("Settings", "Keep43Backdrops", 1, INI_NAME) != 0;
-    g_keep43UI      = GetPrivateProfileIntA("Settings", "Keep43UI", 1, INI_NAME) != 0;
+    g_mode          = GetPrivateProfileIntA("Settings", "Mode", 1, INI_NAME);
+    g_backdropFit   = GetPrivateProfileIntA("Settings", "BackdropFit", 1, INI_NAME);
     g_clipToCanvas  = GetPrivateProfileIntA("Settings", "ClipToCanvas", 1, INI_NAME) != 0;
-    if (g_mode < 0 || g_mode > 2) g_mode = 2;
+    if (g_mode < 0 || g_mode > 2) g_mode = 1;
+    if (g_backdropFit < 0 || g_backdropFit > 1) g_backdropFit = 1;
     if (g_targetWidth < 640 || g_targetHeight < 480) { g_targetWidth = 1920; g_targetHeight = 1080; }
     ComputeVirtualCanvas();
 
@@ -157,9 +155,8 @@ static void LoadConfig()
     {
         WritePrivateProfileStringA("Settings", "Width", "1920", INI_NAME);
         WritePrivateProfileStringA("Settings", "Height", "1080", INI_NAME);
-        WritePrivateProfileStringA("Settings", "Mode", "2", INI_NAME);
-        WritePrivateProfileStringA("Settings", "Keep43Backdrops", "1", INI_NAME);
-        WritePrivateProfileStringA("Settings", "Keep43UI", "1", INI_NAME);
+        WritePrivateProfileStringA("Settings", "Mode", "1", INI_NAME);
+        WritePrivateProfileStringA("Settings", "BackdropFit", "1", INI_NAME);
         WritePrivateProfileStringA("Settings", "ClipToCanvas", "1", INI_NAME);
         WritePrivateProfileStringA("Settings", "ForceFullViewport", "0", INI_NAME);
         WritePrivateProfileStringA("Settings", "LogResourceCalls", "0", INI_NAME);
@@ -456,10 +453,8 @@ static inline void  PP_SF(PPVert& v, int i, float f) { memcpy(&v.d[i], &f, 4); }
 
 struct PPLayout { int strideDW; int diffuse; int specular; int tex; int nTex; };   // offsets in DWORDs, -1 = absent
 
-struct PPStats { unsigned passed, clipped, culled, realsize, backdrop43, ui43, nonfinite; };
-static PPStats g_ppStats = { 0, 0, 0, 0, 0, 0, 0 };
-static bool    g_cur43   = false;      // a 4:3 backdrop was drawn in the frame being built
-static bool    g_prev43  = false;      // ... in the previous frame (menus/loading last many frames)
+struct PPStats { unsigned passed, clipped, culled, realsize, backdrop, nonfinite; };
+static PPStats g_ppStats = { 0, 0, 0, 0, 0, 0 };
 
 static bool PP_MakeLayout(PP_U32 fvf, PPLayout* L)
 {
@@ -579,7 +574,7 @@ static int PP_ClipTri(const PPVert& a, const PPVert& b, const PPVert& c, const P
 static PPVert g_ppWork[64];
 static PPVert g_ppTmp[PP_OUT_CAP];
 
-enum { PP_MAP_WIDE = 0, PP_MAP_BACKDROP43 = 1, PP_MAP_UI43 = 2 };
+enum { PP_MAP_WIDE = 0, PP_MAP_BACKDROP43 = 1 };
 
 // Takes one DrawPrimitive call from the game (virtual-canvas coordinates) and produces
 // the call to make on the real device.
@@ -633,29 +628,21 @@ static int PP_Prepare(PP_U32 type, PP_U32 fvf, const void* verts, PP_U32 count,
         }
     }
 
-    // which placement?
+    // A full-canvas textured 2D quad is a 4:3 picture (loading / title / menu art). With
+    // BackdropFit=1 it is simply stretched with everything else; with BackdropFit=0 it keeps
+    // its 4:3 shape, centred (the bars are cleared to black every frame).
+    bool backdrop = (count == 4) && ((fvf & 0x100) != 0) && ui &&
+                    minx <= 3.0f && miny <= 3.0f &&
+                    maxx >= (float)g_virtW - 3.0f && maxy >= (float)g_virtH - 3.0f;
     int kind = PP_MAP_WIDE;
-    if (g_mode == 1 && g_keep43)
+    if (backdrop)
     {
-        bool backdrop = (count == 4) && ((fvf & 0x100) != 0) && ui &&
-                        minx <= 3.0f && miny <= 3.0f &&
-                        maxx >= (float)g_virtW - 3.0f && maxy >= (float)g_virtH - 3.0f;
-        if (backdrop)
-        {
-            kind = PP_MAP_BACKDROP43;
-            g_cur43 = true;
-            g_ppStats.backdrop43++;
-        }
-        else if (g_keep43UI && ui && (g_prev43 || g_cur43))
-        {
-            kind = PP_MAP_UI43;                 // 640x480-space UI drawn over 4:3 art
-            g_ppStats.ui43++;
-        }
+        g_ppStats.backdrop++;
+        if (g_mode == 1 && g_backdropFit == 0) kind = PP_MAP_BACKDROP43;
     }
 
-    // clip rectangle, in game coordinates
-    float cx0 = 0.0f, cy0 = 0.0f, cx1 = (float)g_virtW, cy1 = (float)g_virtH;
-    if (kind == PP_MAP_UI43) { cx1 = 640.0f; cy1 = 480.0f; }
+    // clip rectangle = the virtual canvas, in game coordinates
+    const float cx0 = 0.0f, cy0 = 0.0f, cx1 = (float)g_virtW, cy1 = (float)g_virtH;
 
     bool inside  = (minx >= cx0 && maxx <= cx1 && miny >= cy0 && maxy <= cy1);
     bool outside = (maxx < cx0 || minx > cx1 || maxy < cy0 || miny > cy1);
@@ -707,9 +694,8 @@ static int PP_Prepare(PP_U32 type, PP_U32 fvf, const void* verts, PP_U32 count,
 
     // game coordinates -> real surface
     float ax, bx, ay, by;
-    if (kind == PP_MAP_WIDE)            { ax = g_scale;     bx = g_offX;  ay = g_scale;     by = g_offY;   }
-    else if (kind == PP_MAP_BACKDROP43) { ax = g_scale43x;  bx = g_off43; ay = g_scale43y;  by = g_offY43; }
-    else                                { ax = g_scale43y;  bx = g_off43; ay = g_scale43y;  by = g_offY43; }
+    if (kind == PP_MAP_WIDE) { ax = g_scaleX;    bx = g_offX;  ay = g_scaleY;    by = g_offY;   }
+    else                     { ax = g_scale43x;  bx = g_off43; ay = g_scale43y;  by = g_offY43; }
     for (i = 0; i < resCount; i++)
     {
         PP_SF(res[i], 0, bx + PP_F(res[i], 0) * ax);
@@ -727,15 +713,13 @@ static int g_ppStatBudget = 40;
 // Called once per frame (from the Flip hook).
 static void PP_EndFrame()
 {
-    g_prev43 = g_cur43;
-    g_cur43  = false;
     static int frames = 0;
     if (g_mode == 0 || !g_recon) return;
     if (++frames % 120 != 0 || g_ppStatBudget <= 0) return;
     g_ppStatBudget--;
-    Log("[CANVAS %d] passed=%u clipped=%u culled=%u realsize=%u backdrop43=%u ui43=%u nonfinite=%u\n",
+    Log("[CANVAS %d] passed=%u clipped=%u culled=%u realsize=%u fullscreen_pictures=%u nonfinite=%u\n",
         frames, g_ppStats.passed, g_ppStats.clipped, g_ppStats.culled, g_ppStats.realsize,
-        g_ppStats.backdrop43, g_ppStats.ui43, g_ppStats.nonfinite);
+        g_ppStats.backdrop, g_ppStats.nonfinite);
     memset(&g_ppStats, 0, sizeof(g_ppStats));
 }
 
@@ -870,7 +854,7 @@ static void TryHookDevice(void* screen)
 // ---------------------------------------------------------------------------
 // exe global at VA 0x443d44 (RVA 0x43d44) points to a context struct whose +8/+0xC
 // are the screen width/height used by all layout code (77 read sites). Tied to this
-// exact exe build; we sanity-check the values before writing. v1.4: first applied from
+// exact exe build; we sanity-check the values before writing. First applied from
 // the SetTextureStageState hook (the first D3D call the exe makes after storing the
 // real size), then re-applied from the Agl7 hooks and every frame as a safety net.
 static bool PokeCtxDims(void* ctx, DWORD w, DWORD h, DWORD* oldW, DWORD* oldH)
@@ -902,8 +886,8 @@ static bool ApplyVirtualScreen(const char* who)
     if (ok && (ow != (DWORD)g_virtW || oh != (DWORD)g_virtH))
     {
         if (changedLogs++ < 5)
-            Log("[Virtual] screen context %p: %ux%u -> %dx%d (mode %d, scale %.4f, offset %.1f,%.1f)  patched by: %s\n",
-                ctx, ow, oh, g_virtW, g_virtH, g_mode, g_scale, g_offX, g_offY, who ? who : "?");
+            Log("[Virtual] screen context %p: %ux%u -> %dx%d (mode %d)  patched by: %s\n",
+                ctx, ow, oh, g_virtW, g_virtH, g_mode, who ? who : "?");
     }
     else if (ok && !heldLogged)
     {
@@ -1091,9 +1075,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
         DisableThreadLibraryCalls(hModule);
         LogInit();
         LoadConfig();
-        Log("PPWidescreenFix v1.4 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
-        Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f  offset=(%.1f,%.1f)  keep43=%d keep43ui=%d clip=%d clearBars=%d\n",
-            g_mode, g_virtW, g_virtH, g_scale, g_offX, g_offY, (int)g_keep43, (int)g_keep43UI, (int)g_clipToCanvas, (int)g_clearBars);
+        Log("PPWidescreenFix v1.5 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
+        Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f,%.4f  offset=(%.1f,%.1f)  backdropFit=%d clip=%d clearBars=%d\n",
+            g_mode, g_virtW, g_virtH, g_scaleX, g_scaleY, g_offX, g_offY, g_backdropFit, (int)g_clipToCanvas, (int)g_clearBars);
         InstallHooks();
     }
     else if (reason == DLL_PROCESS_DETACH)
