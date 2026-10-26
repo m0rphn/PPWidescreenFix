@@ -2,6 +2,14 @@
 // PPWidescreenFix v1.5 - native resolution / widescreen plugin for
 //   Pink Panther: Pinkadelic Pursuit (2002)  -  v1.0 ENGLISH No-CD/Fixed EXE
 //
+// PROJECT GOAL
+// -----------------------------------------------------------------------------
+// This is a clean native fix from first principles: no DDrawCompat wrapper, no
+// dgVoodoo2-style compatibility layer, and no reliance on winmm/ogg-winmm as a
+// prerequisite for the graphical path. The plugin is a dinput8 proxy that fixes
+// the engine's own 640x480 layout at runtime and remaps it to the real monitor
+// resolution.
+//
 // HOW THE GAME RENDERS (verified from the binaries and from the v1.2/v1.3 logs)
 // -----------------------------------------------------------------------------
 //  * Agl7.dll creates a Direct3D 7 HAL device on the DirectDraw back buffer and
@@ -173,7 +181,7 @@ typedef HRESULT (WINAPI *DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*
 static DirectInput8Create_t oDirectInput8Create = nullptr;
 static HMODULE g_hRealDInput8 = nullptr;
 
-extern "C" __declspec(dllexport)
+extern "C"
 HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid, LPVOID* out, LPUNKNOWN outer)
 {
     if (!oDirectInput8Create)
@@ -451,9 +459,19 @@ struct PPVert { PP_U32 d[PP_MAX_DW]; };
 static inline float PP_F(const PPVert& v, int i) { float f; memcpy(&f, &v.d[i], 4); return f; }
 static inline void  PP_SF(PPVert& v, int i, float f) { memcpy(&v.d[i], &f, 4); }
 
+static bool PP_ValidScreenPosition(float x, float y, float z, float rhw)
+{
+    // Keep ample room for projected off-screen geometry, but reject values that
+    // cannot be meaningful screen positions and would poison CPU clipping.
+    const double limit = (double)(g_targetWidth > g_targetHeight ? g_targetWidth : g_targetHeight) * 16.0;
+    return x == x && y == y && z == z && rhw == rhw &&
+           x >= -limit && x <= limit && y >= -limit && y <= limit &&
+           fabs((double)z) <= 1e30 && fabs((double)rhw) <= 1e30;
+}
+
 struct PPLayout { int strideDW; int diffuse; int specular; int tex; int nTex; };   // offsets in DWORDs, -1 = absent
 
-struct PPStats { unsigned passed, clipped, culled, realsize, backdrop, nonfinite; };
+struct PPStats { unsigned passed, clipped, culled, realsize, backdrop, invalid; };
 static PPStats g_ppStats = { 0, 0, 0, 0, 0, 0 };
 
 static bool PP_MakeLayout(PP_U32 fvf, PPLayout* L)
@@ -601,7 +619,8 @@ static int PP_Prepare(PP_U32 type, PP_U32 fvf, const void* verts, PP_U32 count,
     for (i = 0; i < count; i++)
     {
         float x = PP_F(g_ppWork[i], 0), y = PP_F(g_ppWork[i], 1), z = PP_F(g_ppWork[i], 2);
-        if (!(x > -1e12f && x < 1e12f && y > -1e12f && y < 1e12f)) { g_ppStats.nonfinite++; return 0; }
+        float rhw = PP_F(g_ppWork[i], 3);
+        if (!PP_ValidScreenPosition(x, y, z, rhw)) { g_ppStats.invalid++; return 0; }
         if (x < minx) minx = x;
         if (x > maxx) maxx = x;
         if (y < miny) miny = y;
@@ -628,10 +647,27 @@ static int PP_Prepare(PP_U32 type, PP_U32 fvf, const void* verts, PP_U32 count,
         }
     }
 
+    // Older intro/backdrop draws can retain the original 640x480 coordinates
+    // after the context has been virtualized. Restrict this correction to an
+    // exact full-screen textured quad so ordinary 640x480-sized art is untouched.
+    bool legacyBackdrop = count == 4 && (type == 5 || type == 6) && ui && L.nTex > 0 &&
+                          minx >= -8.0f && minx <= 4.0f &&
+                          miny >= -8.0f && miny <= 4.0f &&
+                          maxx >= 636.0f && maxx <= 644.0f &&
+                          maxy >= 476.0f && maxy <= 486.0f;
+    if (legacyBackdrop && g_mode == 1 && g_virtW != 640)
+    {
+        float kx = (float)g_virtW / 640.0f;
+        for (i = 0; i < count; i++)
+            PP_SF(g_ppWork[i], 0, PP_F(g_ppWork[i], 0) * kx);
+        minx *= kx;
+        maxx *= kx;
+    }
+
     // A full-canvas textured 2D quad is a 4:3 picture (loading / title / menu art). With
     // BackdropFit=1 it is simply stretched with everything else; with BackdropFit=0 it keeps
     // its 4:3 shape, centred (the bars are cleared to black every frame).
-    bool backdrop = (count == 4) && ((fvf & 0x100) != 0) && ui &&
+    bool backdrop = (count == 4) && L.nTex > 0 && ui &&
                     minx <= 3.0f && miny <= 3.0f &&
                     maxx >= (float)g_virtW - 3.0f && maxy >= (float)g_virtH - 3.0f;
     int kind = PP_MAP_WIDE;
@@ -717,9 +753,9 @@ static void PP_EndFrame()
     if (g_mode == 0 || !g_recon) return;
     if (++frames % 120 != 0 || g_ppStatBudget <= 0) return;
     g_ppStatBudget--;
-    Log("[CANVAS %d] passed=%u clipped=%u culled=%u realsize=%u fullscreen_pictures=%u nonfinite=%u\n",
+    Log("[CANVAS %d] passed=%u clipped=%u culled=%u realsize=%u fullscreen_pictures=%u invalid=%u\n",
         frames, g_ppStats.passed, g_ppStats.clipped, g_ppStats.culled, g_ppStats.realsize,
-        g_ppStats.backdrop, g_ppStats.nonfinite);
+        g_ppStats.backdrop, g_ppStats.invalid);
     memset(&g_ppStats, 0, sizeof(g_ppStats));
 }
 

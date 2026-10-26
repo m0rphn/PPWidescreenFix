@@ -1,9 +1,16 @@
 # PPWidescreenFix v1.5
 
 Native resolution / **true widescreen** plugin for **Pink Panther: Pinkadelic Pursuit (2002)**
-(v1.0 ENGLISH No-CD/Fixed EXE). Loads as a `dinput8.dll` proxy; works alongside
-[DDrawCompat](https://github.com/narzoul/DDrawCompat) and
-[ogg-winmm](https://github.com/ayuanx/ogg-winmm) (they proxy other DLLs).
+(v1.0 ENGLISH No-CD/Fixed EXE).
+
+This project is designed as a **clean native fix**: a `dinput8.dll` proxy that hooks the game at
+runtime and remaps the engine’s own 640x480 layout to the user’s monitor resolution, without
+requiring [DDrawCompat](https://github.com/narzoul/DDrawCompat), dgVoodoo2, or `ogg-winmm` as a
+prerequisite for the visual fix.
+
+The audio path is intentionally kept separate from the graphics fix. The base objective is a
+stable widescreen render path that works without any compatibility layer or Windows multimedia
+shim; sound adjustments are a later subsystem, not a dependency of the visual patch.
 
 ## How the game renders (verified)
 - `Agl7.dll` creates a **Direct3D 7 HAL device** on the DirectDraw back buffer
@@ -36,6 +43,11 @@ screen (no bars); `BackdropFit=0` keeps them 4:3, centred, with black bars.
 - **Clipping.** v1.3 forced the real viewport to the whole surface, so geometry that the
   original viewport used to cut off was drawn outside the picture. Now every triangle/quad is
   clipped to the virtual canvas (perspective-correct texture coordinates).
+- Draws containing non-finite or wildly out-of-range screen positions are skipped before
+  clipping; the per-interval `invalid` count reports these malformed draws.
+- Full-screen textured quads still using the original 640x480 bounds are recognized
+  separately from ordinary sprites and expanded to the virtual canvas before backdrop
+  fitting, preserving their texture coordinates.
 - **Early virtual size.** The plugin overwrites the exe's screen-size struct at the first
   Direct3D call after the exe stored the real size, so nothing is built with real-size
   coordinates (the loading / title backdrops were). A safety net also normalises any
@@ -53,14 +65,18 @@ screen (no bars); `BackdropFit=0` keeps them 4:3, centred, with black bars.
 
 ## Install
 1. Build `dinput8.dll` with GitHub Actions (Actions -> *Build PPWidescreenFix* -> Run workflow
-   -> download the `dinput8-dll` artifact).
+   -> download the `dinput8-dll` artifact). The workflow builds an x86 proxy against the pinned
+   MinHook v1.3.3 source and checks the proxy export and runtime dependencies before upload.
 2. Game folder: real `dinput8.dll` renamed `dinput8_orig.dll`, plugin as `dinput8.dll`.
 3. Run once; edit the generated `PPWidescreenFix.ini`.
 
-## DDrawCompat notes
-- Don't force `DisplayAspectRatio=4:3`; leave it at `app`.
-- The game now renders at your real resolution, so `ResolutionScale=app(3)` means 3x that
-  (5760x3240 at 1080p) - try `app(1)` or `app(2)`.
+## Native fix notes
+- This project is intentionally built to run without DDrawCompat, dgVoodoo2, or `ogg-winmm` as
+  a prerequisite for the visual fix.
+- If a compatibility layer is used as an auxiliary tool, it should be treated as optional and
+  should not be required for the game to render correctly.
+- The sound path remains a separate concern from the render path; a direct audio fix should be
+  handled on its own and not mixed into the widescreen patch.
 
 ## Testing procedure
 1. `Mode=1` (default): menu, loading screen, gameplay (indoor + outdoor), pause menu. Check
