@@ -71,7 +71,7 @@ static int  g_targetHeight  = 1080;
 static bool g_forceViewport = true;
 static bool g_logResources  = false;
 static bool g_logToFile     = true;
-static bool g_recon         = true;   // log what the game sends to Direct3D (no behaviour change)
+static bool g_recon         = false;  // enable detailed Direct3D diagnostics only when needed
 
 //   Mode 0 = off, Mode 1 = widescreen (Hor+), Mode 2 = 640x480 pillarbox
 static int   g_mode          = 1;
@@ -149,7 +149,7 @@ static void LoadConfig()
     g_targetHeight  = GetPrivateProfileIntA("Settings", "Height", 1080, INI_NAME);
     g_forceViewport = GetPrivateProfileIntA("Settings", "ForceFullViewport", 0, INI_NAME) != 0;
     g_logResources  = GetPrivateProfileIntA("Settings", "LogResourceCalls", 0, INI_NAME) != 0;
-    g_recon         = GetPrivateProfileIntA("Settings", "Recon", 1, INI_NAME) != 0;
+    g_recon         = GetPrivateProfileIntA("Settings", "Recon", 0, INI_NAME) != 0;
     g_mode          = GetPrivateProfileIntA("Settings", "Mode", 1, INI_NAME);
     g_backdropFit   = GetPrivateProfileIntA("Settings", "BackdropFit", 1, INI_NAME);
     g_clipToCanvas  = GetPrivateProfileIntA("Settings", "ClipToCanvas", 1, INI_NAME) != 0;
@@ -168,31 +168,65 @@ static void LoadConfig()
         WritePrivateProfileStringA("Settings", "ClipToCanvas", "1", INI_NAME);
         WritePrivateProfileStringA("Settings", "ForceFullViewport", "0", INI_NAME);
         WritePrivateProfileStringA("Settings", "LogResourceCalls", "0", INI_NAME);
-        WritePrivateProfileStringA("Settings", "Recon", "1", INI_NAME);
+        WritePrivateProfileStringA("Settings", "Recon", "0", INI_NAME);
     }
 }
 
 // ---------------------------------------------------------------------------
 // dinput8.dll proxy plumbing
 // ---------------------------------------------------------------------------
-// The exe's only DINPUT8.dll import is DirectInput8Create, so we only need to
-// forward that one function to the real dll (renamed dinput8_orig.dll).
+// The exe's only DINPUT8.dll import is DirectInput8Create. Load the Windows
+// copy by absolute system-directory path so no renamed game-folder DLL is needed.
 typedef HRESULT (WINAPI *DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
 static DirectInput8Create_t oDirectInput8Create = nullptr;
 static HMODULE g_hRealDInput8 = nullptr;
+static INIT_ONCE g_dinput8InitOnce = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK InitializeRealDInput8(PINIT_ONCE, PVOID, PVOID*)
+{
+    wchar_t path[MAX_PATH];
+    UINT length = GetSystemDirectoryW(path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+    {
+        if (length >= MAX_PATH) SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    const wchar_t dllName[] = L"\\dinput8.dll";
+    const size_t dllNameLength = sizeof(dllName) / sizeof(dllName[0]);
+    if ((size_t)length + dllNameLength > MAX_PATH)
+    {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+    memcpy(path + length, dllName, sizeof(dllName));
+
+    HMODULE module = LoadLibraryW(path);
+    if (!module) return FALSE;
+
+    DirectInput8Create_t proc =
+        (DirectInput8Create_t)GetProcAddress(module, "DirectInput8Create");
+    if (!proc)
+    {
+        DWORD error = GetLastError();
+        FreeLibrary(module);
+        SetLastError(error);
+        return FALSE;
+    }
+
+    g_hRealDInput8 = module;
+    oDirectInput8Create = proc;
+    return TRUE;
+}
 
 extern "C"
 HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid, LPVOID* out, LPUNKNOWN outer)
 {
-    if (!oDirectInput8Create)
+    if (!InitOnceExecuteOnce(&g_dinput8InitOnce, InitializeRealDInput8, nullptr, nullptr))
     {
-        if (!g_hRealDInput8)
-            g_hRealDInput8 = LoadLibraryA("dinput8_orig.dll");
-        if (g_hRealDInput8)
-            oDirectInput8Create = (DirectInput8Create_t)GetProcAddress(g_hRealDInput8, "DirectInput8Create");
+        DWORD error = GetLastError();
+        return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
-    if (!oDirectInput8Create)
-        return E_FAIL;
     return oDirectInput8Create(hinst, ver, riid, out, outer);
 }
 

@@ -61,13 +61,14 @@ screen (no bars); `BackdropFit=0` keeps them 4:3, centred, with black bars.
 | `Mode` | 1 | 1 widescreen / 2 pillarbox / 0 off |
 | `BackdropFit` | 1 | mode 1: 1 = stretch full-screen pictures, 0 = keep 4:3 with bars |
 | `ClipToCanvas` | 1 | 0 = v1.3 behaviour (for comparison) |
-| `Recon` | 1 | write diagnostic lines to `PPWidescreenFix.log` |
+| `Recon` | 0 | set to 1 to log detailed Direct3D diagnostics to `PPWidescreenFix.log` |
 
 ## Install
 1. Build `dinput8.dll` with GitHub Actions (Actions -> *Build PPWidescreenFix* -> Run workflow
    -> download the `dinput8-dll` artifact). The workflow builds an x86 proxy against the pinned
    MinHook v1.3.3 source and checks the proxy export and runtime dependencies before upload.
-2. Game folder: real `dinput8.dll` renamed `dinput8_orig.dll`, plugin as `dinput8.dll`.
+2. Put the plugin `dinput8.dll` in the game folder. No `dinput8_orig.dll` is needed;
+   the proxy forwards DirectInput to the Windows copy in the system directory.
 3. Run once; edit the generated `PPWidescreenFix.ini`.
 
 ## Native fix notes
