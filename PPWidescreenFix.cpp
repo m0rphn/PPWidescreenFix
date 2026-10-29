@@ -1,5 +1,5 @@
 // ============================================================================
-// PPWidescreenFix v1.5 - native resolution / widescreen plugin for
+// PPWidescreenFix v1.5.1 - native resolution / widescreen plugin for
 //   Pink Panther: Pinkadelic Pursuit (2002)  -  v1.0 ENGLISH No-CD/Fixed EXE
 //
 // PROJECT GOAL
@@ -87,6 +87,7 @@ static const int ORIG_CLIENT_WIDTH  = 640;
 static const int ORIG_CLIENT_HEIGHT = 480;
 
 static FILE* g_log = nullptr;
+static INIT_ONCE g_logInitOnce = INIT_ONCE_STATIC_INIT;
 
 // defined further down; the AGLSCREEN hooks call them
 static void TryHookDevice(void* screen);
@@ -106,13 +107,20 @@ static bool WidescreenActive()
            InterlockedCompareExchange(&g_displayModeReady, 0, 0) != 0;
 }
 
-static void LogInit()
+static BOOL CALLBACK InitializeLog(PINIT_ONCE, PVOID, PVOID*)
 {
-    if (g_logToFile)
+    if (g_logToFile && !g_log)
     {
         if (fopen_s(&g_log, "PPWidescreenFix.log", "w") != 0 || !g_log)
             OutputDebugStringA("PPWidescreenFix: could not open PPWidescreenFix.log\n");
     }
+    return TRUE;
+}
+
+static void LogInit()
+{
+    if (!InitOnceExecuteOnce(&g_logInitOnce, InitializeLog, nullptr, nullptr))
+        OutputDebugStringA("PPWidescreenFix: log initialization failed\n");
 }
 
 static void Log(const char* fmt, ...)
@@ -334,14 +342,21 @@ static BOOL CALLBACK InitializeRealDInput8(PINIT_ONCE, PVOID, PVOID*)
 extern "C"
 HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid, LPVOID* out, LPUNKNOWN outer)
 {
-    if (!InitOnceExecuteOnce(&g_fixInitOnce, InitializeFix, nullptr, nullptr))
-        OutputDebugStringA("PPWidescreenFix: fix initialization failed; forwarding DirectInput without hooks\n");
+    LogInit();
     if (!InitOnceExecuteOnce(&g_dinput8InitOnce, InitializeRealDInput8, nullptr, nullptr))
     {
         DWORD error = GetLastError();
+        Log("[DirectInput] system dinput8 load/resolve failed (error=%lu)\n", error);
         return error ? HRESULT_FROM_WIN32(error) : E_FAIL;
     }
-    return oDirectInput8Create(hinst, ver, riid, out, outer);
+
+    Log("[DirectInput] forwarding DirectInput8Create to the system DLL\n");
+    HRESULT result = oDirectInput8Create(hinst, ver, riid, out, outer);
+    Log("[DirectInput] system DirectInput8Create returned 0x%08X\n", (unsigned)result);
+
+    if (!InitOnceExecuteOnce(&g_fixInitOnce, InitializeFix, nullptr, nullptr))
+        Log("[Init] fix initialization failed (error=%lu); DirectInput result is preserved\n", GetLastError());
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,7 +1290,7 @@ static BOOL CALLBACK InitializeFix(PINIT_ONCE, PVOID, PVOID*)
 {
     LogInit();
     LoadConfig();
-    Log("PPWidescreenFix v1.5 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
+    Log("PPWidescreenFix v1.5.1 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
     Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f,%.4f  offset=(%.1f,%.1f)  backdropFit=%d clip=%d clearBars=%d\n",
         g_mode, g_virtW, g_virtH, g_scaleX, g_scaleY, g_offX, g_offY, g_backdropFit, (int)g_clipToCanvas, (int)g_clearBars);
 

@@ -1,4 +1,4 @@
-# PPWidescreenFix v1.5
+# PPWidescreenFix v1.5.1
 
 Native resolution / **true widescreen** plugin for **Pink Panther: Pinkadelic Pursuit (2002)**
 (v1.0 ENGLISH No-CD/Fixed EXE).
@@ -11,9 +11,11 @@ prerequisite for the visual fix.
 The executable-specific hooks are enabled only for the supported 32-bit No-CD/Fixed executable
 with SHA-256 `feb36c051d8a16b3200125b3924c6c7f93bc68e9c6908b9df8bb451921551532`. Other
 executables still receive normal `DirectInput8Create` forwarding, but the widescreen hooks are
-not installed. Configuration and hooks initialize on the first `DirectInput8Create` call rather
-than from `DllMain`. Agl7's `SetDisplayMode` returns zero on success; virtual-canvas changes and
-the sky-rectangle patch are enabled only after that success result.
+not installed. The proxy forwards `DirectInput8Create` to the system DLL before initializing its
+configuration and hooks on the first call, rather than doing setup from `DllMain`; the log records
+the system forwarding result before hook initialization. Agl7's `SetDisplayMode` returns zero on
+success; virtual-canvas changes and the sky-rectangle patch are enabled only after that success
+result.
 
 The audio path is intentionally kept separate from the graphics fix. The base objective is a
 stable widescreen render path that works without any compatibility layer or Windows multimedia
