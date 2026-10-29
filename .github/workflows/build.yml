@@ -26,7 +26,7 @@ jobs:
             PPWidescreenFix.cpp ^
             minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde32.c ^
             /Fe:dinput8.dll ^
-            /link /MACHINE:X86 /DEF:dinput8.def
+            /link /MACHINE:X86 /DEF:dinput8.def advapi32.lib
 
       - name: Verify x86 export and native dependencies
         shell: pwsh
