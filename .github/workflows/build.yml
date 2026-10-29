@@ -11,7 +11,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Clone MinHook source
-        run: git clone --depth 1 https://github.com/TsudaKageyu/minhook.git minhook
+        run: git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git minhook
 
       - name: Setup MSVC build environment (x86 / 32-bit)
         uses: ilammy/msvc-dev-cmd@v1
@@ -26,7 +26,25 @@ jobs:
             PPWidescreenFix.cpp ^
             minhook\src\buffer.c minhook\src\hook.c minhook\src\trampoline.c minhook\src\hde\hde32.c ^
             /Fe:dinput8.dll ^
-            /link /DEF:dinput8.def
+            /link /MACHINE:X86 /DEF:dinput8.def
+
+      - name: Verify x86 export and native dependencies
+        shell: pwsh
+        run: |
+          $headers = dumpbin /headers dinput8.dll | Out-String
+          if ($headers -notmatch '14C machine \(x86\)') {
+            throw "dinput8.dll is not an x86 DLL"
+          }
+
+          $exports = dumpbin /exports dinput8.dll | Out-String
+          if ($exports -notmatch '\bDirectInput8Create\b') {
+            throw "DirectInput8Create is missing from the proxy exports"
+          }
+
+          $dependencies = dumpbin /dependents dinput8.dll | Out-String
+          if ($dependencies -match '(?i)(winmm\.dll|ogg-winmm)') {
+            throw "The widescreen proxy must not depend on winmm or ogg-winmm"
+          }
 
       - name: Upload built DLL
         uses: actions/upload-artifact@v4
