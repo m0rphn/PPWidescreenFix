@@ -8,6 +8,13 @@ runtime and remaps the engine’s own 640x480 layout to the user’s monitor res
 requiring [DDrawCompat](https://github.com/narzoul/DDrawCompat), dgVoodoo2, or `ogg-winmm` as a
 prerequisite for the visual fix.
 
+The executable-specific hooks are enabled only for the supported 32-bit No-CD/Fixed executable
+with SHA-256 `feb36c051d8a16b3200125b3924c6c7f93bc68e9c6908b9df8bb451921551532`. Other
+executables still receive normal `DirectInput8Create` forwarding, but the widescreen hooks are
+not installed. Configuration and hooks initialize on the first `DirectInput8Create` call rather
+than from `DllMain`. Agl7's `SetDisplayMode` returns zero on success; virtual-canvas changes and
+the sky-rectangle patch are enabled only after that success result.
+
 The audio path is intentionally kept separate from the graphics fix. The base objective is a
 stable widescreen render path that works without any compatibility layer or Windows multimedia
 shim; sound adjustments are a later subsystem, not a dependency of the visual patch.

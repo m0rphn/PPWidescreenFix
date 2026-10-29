@@ -61,6 +61,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <math.h>
+#include <wincrypt.h>
 #include "MinHook.h"
 
 // ---------------------------------------------------------------------------
@@ -90,13 +91,28 @@ static FILE* g_log = nullptr;
 // defined further down; the AGLSCREEN hooks call them
 static void TryHookDevice(void* screen);
 static bool ApplyVirtualScreen(const char* who = "Agl7 hook");
-static bool g_sdmReturned = false;   // AGLSCREEN::SetDisplayMode has returned to the exe
+static volatile LONG g_supportedExecutable = 0;
+static volatile LONG g_displayModeReady = 0;
+static volatile LONG g_displayModeInProgress = 0;
+static volatile LONG g_skyPatchApplied = 0;
 static void ClearBackBuffer(void* screen);
+static void PatchSkyRectangleEntity();
+static void InstallHooks();
+static BOOL CALLBACK InitializeFix(PINIT_ONCE, PVOID, PVOID*);
+
+static bool WidescreenActive()
+{
+    return InterlockedCompareExchange(&g_supportedExecutable, 0, 0) != 0 &&
+           InterlockedCompareExchange(&g_displayModeReady, 0, 0) != 0;
+}
 
 static void LogInit()
 {
     if (g_logToFile)
-        fopen_s(&g_log, "PPWidescreenFix.log", "w");
+    {
+        if (fopen_s(&g_log, "PPWidescreenFix.log", "w") != 0 || !g_log)
+            OutputDebugStringA("PPWidescreenFix: could not open PPWidescreenFix.log\n");
+    }
 }
 
 static void Log(const char* fmt, ...)
@@ -172,6 +188,101 @@ static void LoadConfig()
     }
 }
 
+static bool IsSupportedExecutable()
+{
+    static const BYTE expectedSha256[32] = {
+        0xFE, 0xB3, 0x6C, 0x05, 0x1D, 0x8A, 0x16, 0xB3,
+        0x20, 0x01, 0x25, 0xB3, 0x92, 0x4C, 0x6C, 0x7F,
+        0x93, 0xBC, 0x68, 0xE9, 0xC6, 0x90, 0x8B, 0x9D,
+        0xF8, 0xBB, 0x45, 0x19, 0x21, 0x55, 0x15, 0x32
+    };
+    wchar_t path[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+    {
+        Log("[Build] Cannot identify executable path (error=%lu)\n", GetLastError());
+        return false;
+    }
+
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        Log("[Build] Cannot open executable for identity check (error=%lu)\n", GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER fileSize;
+    HCRYPTPROV provider = 0;
+    HCRYPTHASH hash = 0;
+    BYTE buffer[16384];
+    DWORD bytesRead = 0;
+    BYTE actualSha256[32];
+    DWORD hashSize = (DWORD)sizeof(actualSha256);
+
+    if (!GetFileSizeEx(file, &fileSize))
+    {
+        Log("[Build] Cannot read executable size (error=%lu)\n", GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+    if (fileSize.QuadPart != 290816)
+    {
+        Log("[Build] Unsupported executable size; widescreen hooks were not installed\n");
+        CloseHandle(file);
+        return false;
+    }
+    if (!CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+    {
+        Log("[Build] SHA-256 provider unavailable (error=%lu)\n", GetLastError());
+        CloseHandle(file);
+        return false;
+    }
+    if (!CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash))
+    {
+        Log("[Build] Cannot create executable SHA-256 hash (error=%lu)\n", GetLastError());
+        CryptReleaseContext(provider, 0);
+        CloseHandle(file);
+        return false;
+    }
+
+    BOOL readOk = TRUE;
+    while ((readOk = ReadFile(file, buffer, sizeof(buffer), &bytesRead, NULL)) && bytesRead != 0)
+    {
+        if (!CryptHashData(hash, buffer, bytesRead, 0))
+        {
+            readOk = FALSE;
+            break;
+        }
+    }
+    bool hashRead = readOk &&
+                    CryptGetHashParam(hash, HP_HASHVAL, actualSha256, &hashSize, 0) &&
+                    hashSize == (DWORD)sizeof(expectedSha256);
+    if (hashRead && memcmp(actualSha256, expectedSha256, sizeof(expectedSha256)) == 0)
+    {
+        CryptDestroyHash(hash);
+        CryptReleaseContext(provider, 0);
+        CloseHandle(file);
+        return true;
+    }
+    else if (!readOk)
+    {
+        Log("[Build] Failed while hashing executable (error=%lu)\n", GetLastError());
+    }
+    else if (!hashRead)
+    {
+        Log("[Build] Failed to read executable SHA-256 digest (error=%lu)\n", GetLastError());
+    }
+    else
+    {
+        Log("[Build] Executable SHA-256 does not match the supported No-CD build; widescreen hooks were not installed\n");
+    }
+    CryptDestroyHash(hash);
+    CryptReleaseContext(provider, 0);
+    CloseHandle(file);
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // dinput8.dll proxy plumbing
 // ---------------------------------------------------------------------------
@@ -181,6 +292,7 @@ typedef HRESULT (WINAPI *DirectInput8Create_t)(HINSTANCE, DWORD, REFIID, LPVOID*
 static DirectInput8Create_t oDirectInput8Create = nullptr;
 static HMODULE g_hRealDInput8 = nullptr;
 static INIT_ONCE g_dinput8InitOnce = INIT_ONCE_STATIC_INIT;
+static INIT_ONCE g_fixInitOnce = INIT_ONCE_STATIC_INIT;
 
 static BOOL CALLBACK InitializeRealDInput8(PINIT_ONCE, PVOID, PVOID*)
 {
@@ -222,6 +334,8 @@ static BOOL CALLBACK InitializeRealDInput8(PINIT_ONCE, PVOID, PVOID*)
 extern "C"
 HRESULT WINAPI DirectInput8Create(HINSTANCE hinst, DWORD ver, REFIID riid, LPVOID* out, LPUNKNOWN outer)
 {
+    if (!InitOnceExecuteOnce(&g_fixInitOnce, InitializeFix, nullptr, nullptr))
+        OutputDebugStringA("PPWidescreenFix: fix initialization failed; forwarding DirectInput without hooks\n");
     if (!InitOnceExecuteOnce(&g_dinput8InitOnce, InitializeRealDInput8, nullptr, nullptr))
     {
         DWORD error = GetLastError();
@@ -267,7 +381,8 @@ static SetViewport_t oSetViewport = nullptr;
 long __fastcall hkSetViewport(void* pThis, void* /*edx*/, DWORD x, DWORD y, DWORD w, DWORD h)
 {
     long r;
-    if (g_mode != 0)
+    if (g_mode != 0 &&
+        (WidescreenActive() || InterlockedCompareExchange(&g_displayModeInProgress, 0, 0) != 0))
     {
         static int n = 0;
         if (n++ < 5)
@@ -307,10 +422,22 @@ long __fastcall hkSetDisplayMode(void* pThis, void* /*edx*/, DWORD width, DWORD 
         height = (DWORD)g_targetHeight;
     }
 
+    InterlockedExchange(&g_displayModeReady, 0);
+    InterlockedExchange(&g_displayModeInProgress, 1);
     long result = oSetDisplayMode(pThis, width, height, bpp, flag);
+    InterlockedExchange(&g_displayModeInProgress, 0);
     Log("[SetDisplayMode] result = %ld\n", result);
-    TryHookDevice(pThis);
-    g_sdmReturned = true;     // from here on the exe stores the real size in its context struct
+    if (result == 0)
+    {
+        InterlockedExchange(&g_displayModeReady, 1);
+        TryHookDevice(pThis);
+        if (InterlockedCompareExchange(&g_skyPatchApplied, 1, 0) == 0)
+            PatchSkyRectangleEntity();
+    }
+    else
+    {
+        Log("[SetDisplayMode] failed; virtual canvas changes are disabled\n");
+    }
     return result;
 }
 
@@ -784,7 +911,7 @@ static int g_ppStatBudget = 40;
 static void PP_EndFrame()
 {
     static int frames = 0;
-    if (g_mode == 0 || !g_recon) return;
+    if (g_mode == 0 || !g_recon || !WidescreenActive()) return;
     if (++frames % 120 != 0 || g_ppStatBudget <= 0) return;
     g_ppStatBudget--;
     Log("[CANVAS %d] passed=%u clipped=%u culled=%u realsize=%u fullscreen_pictures=%u invalid=%u\n",
@@ -796,7 +923,7 @@ static void PP_EndFrame()
 static HRESULT WINAPI hkDrawPrimitive(void* dev, DWORD type, DWORD fvf, void* verts, DWORD count, DWORD flags)
 {
     if (g_recon) ReconDraw(type, fvf, verts, count);
-    if (g_mode != 0)
+    if (g_mode != 0 && WidescreenActive())
     {
         static PP_U8 s_out[PP_OUT_CAP * PP_MAX_DW * 4];
         PP_U32 oType = 0, oCount = 0;
@@ -818,7 +945,7 @@ static HRESULT WINAPI hkD3DSetViewport(void* dev, D3DVIEWPORT7_* vp)
             Log("[D3D SetViewport] x=%u y=%u w=%u h=%u z=[%.2f .. %.2f]\n", vp->x, vp->y, vp->w, vp->h, vp->minZ, vp->maxZ);
         }
     }
-    if (g_mode != 0 && vp)
+    if (g_mode != 0 && WidescreenActive() && vp)
     {
         // The real viewport stays the whole surface: all clipping to the canvas is done
         // by the plugin (PP_Prepare), independent of how D3D treats XYZRHW vertices.
@@ -859,7 +986,7 @@ static HRESULT WINAPI hkD3DSetTextureStageState(void* dev, DWORD stage, DWORD ty
 {
     // Only the first calls after SetDisplayMode matter (the exe stores the real size right
     // after it returns); the poke is idempotent, so doing it a few times is harmless.
-    if (g_sdmReturned && g_earlyCalls < 64 && g_mode != 0)
+    if (WidescreenActive() && g_earlyCalls < 64 && g_mode != 0)
     {
         g_earlyCalls++;
         ApplyVirtualScreen("SetTextureStageState hook (early)");
@@ -878,12 +1005,23 @@ static bool ReadPtrSafe(const void* addr, void** out)
 // functions - only once, since every device uses the same implementations.
 static void TryHookDevice(void* screen)
 {
-    if ((!g_recon && g_mode == 0) || !screen || g_hookedDrawFn) return;
+    if ((!g_recon && g_mode == 0) || !screen) return;
 
     void* dev = nullptr;
     if (!ReadPtrSafe((const BYTE*)screen + 0x160, &dev) || !dev) return;
     void** vtbl = nullptr;
     if (!ReadPtrSafe(dev, (void**)&vtbl) || !vtbl) return;
+
+    if (g_hookedDrawFn)
+    {
+        if (WidescreenActive() && oD3DSetViewport)
+        {
+            D3DVIEWPORT7_ v = { 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight, 0.0f, 1.0f };
+            HRESULT hr = oD3DSetViewport(dev, &v);
+            Log("[D3D] real viewport restored after successful mode setup -> hr=0x%08X\n", (unsigned)hr);
+        }
+        return;
+    }
 
     void* fnDraw = nullptr; void* fnVp = nullptr; void* fnTr = nullptr; void* fnTss = nullptr;
     if (!ReadPtrSafe(&vtbl[25], &fnDraw) || !fnDraw) return;
@@ -911,7 +1049,7 @@ static void TryHookDevice(void* screen)
 
     // Agl7 already issued its first SetViewport (with the virtual size) before we could hook
     // the device, so set the real full-surface viewport ourselves once.
-    if (g_mode != 0 && oD3DSetViewport)
+    if (WidescreenActive() && oD3DSetViewport)
     {
         D3DVIEWPORT7_ v = { 0, 0, (DWORD)g_targetWidth, (DWORD)g_targetHeight, 0.0f, 1.0f };
         HRESULT hr = oD3DSetViewport(dev, &v);
@@ -944,7 +1082,7 @@ static bool PokeCtxDims(void* ctx, DWORD w, DWORD h, DWORD* oldW, DWORD* oldH)
 // Returns true when the context struct holds the virtual size afterwards.
 static bool ApplyVirtualScreen(const char* who)
 {
-    if (g_mode == 0) return false;
+    if (g_mode == 0 || !WidescreenActive()) return false;
     BYTE* exeBase = (BYTE*)GetModuleHandleA(NULL);
     void* ctx = nullptr;
     if (!exeBase || !ReadPtrSafe(exeBase + 0x43d44, &ctx) || !ctx) return false;     // not created yet
@@ -974,7 +1112,7 @@ typedef HRESULT (WINAPI *D3DClear_t)(void* dev, DWORD cnt, void* rects, DWORD fl
 // Black out the back buffer after each Flip so the bars never show stale pixels.
 static void ClearBackBuffer(void* screen)
 {
-    if (!g_clearBars || !screen) return;
+    if (!WidescreenActive() || !g_clearBars || !screen) return;
     void* dev = nullptr; void** vtbl = nullptr; void* fn = nullptr;
     if (!ReadPtrSafe((const BYTE*)screen + 0x160, &dev) || !dev) return;
     if (!ReadPtrSafe(dev, (void**)&vtbl) || !vtbl) return;
@@ -1131,8 +1269,23 @@ static void InstallHooks()
         Log("Agl7.dll not found/loadable - is this DLL sitting in the game folder?\n");
     }
 
-    // --- exe-internal sky/background rectangle patch ---
-    PatchSkyRectangleEntity();
+}
+
+static BOOL CALLBACK InitializeFix(PINIT_ONCE, PVOID, PVOID*)
+{
+    LogInit();
+    LoadConfig();
+    Log("PPWidescreenFix v1.5 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
+    Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f,%.4f  offset=(%.1f,%.1f)  backdropFit=%d clip=%d clearBars=%d\n",
+        g_mode, g_virtW, g_virtH, g_scaleX, g_scaleY, g_offX, g_offY, g_backdropFit, (int)g_clipToCanvas, (int)g_clearBars);
+
+    if (!IsSupportedExecutable())
+        return TRUE;
+
+    InterlockedExchange(&g_supportedExecutable, 1);
+    Log("[Build] Supported No-CD executable fingerprint verified (SHA-256)\n");
+    InstallHooks();
+    return TRUE;
 }
 
 // ---------------------------------------------------------------------------
@@ -1143,17 +1296,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
     if (reason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
-        LogInit();
-        LoadConfig();
-        Log("PPWidescreenFix v1.5 loaded. Target resolution: %dx%d\n", g_targetWidth, g_targetHeight);
-        Log("[Mode] %d  virtual canvas %dx%d  scale=%.4f,%.4f  offset=(%.1f,%.1f)  backdropFit=%d clip=%d clearBars=%d\n",
-            g_mode, g_virtW, g_virtH, g_scaleX, g_scaleY, g_offX, g_offY, g_backdropFit, (int)g_clipToCanvas, (int)g_clearBars);
-        InstallHooks();
-    }
-    else if (reason == DLL_PROCESS_DETACH)
-    {
-        MH_Uninitialize();
-        if (g_log) fclose(g_log);
     }
     return TRUE;
 }
